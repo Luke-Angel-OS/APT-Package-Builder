@@ -1,0 +1,130 @@
+name: Bulk Build Luke Angel OS Core Dependency Tree
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Configure Multiarch and Install Mapping Utilities
+      run: |
+        sudo dpkg --add-architecture i386
+        sudo apt-get update
+        sudo apt-get install -y devscripts debhelper dpkg-dev build-essential \
+                                gcc-multilib g++-multilib apt-rdepends
+
+    - name: Auto-Fetch Complete Dependency Sources
+      run: |
+        mkdir -p src/
+        cd src/
+        
+        # Enable source repositories in the runner
+        sudo sed -i 's/^# deb-src/deb-src/g' /etc/apt/sources.list || true
+        sudo apt-get update
+        
+        echo "=== Mapping and Fetching Package Graph ==="
+        # 1. Gather all Runtime Dependencies, Recommendations, and Build-Deps for nala
+        # Filtering out core system packages (libc, gcc, systemd, base-files, python3-minimal etc.)
+        RAW_DEPS=$(apt-rdepends --follow=Depends,Recommends nala 2>/dev/null | grep -v '^ ' | grep -v 'E:')
+        BUILD_DEPS=$(apt-cache showsrc nala | grep -E '^Build-Depends:' | sed 's/Build-Depends://g' | tr ',' '\n' | awk '{print $1}')
+        
+        # Merge, deduplicate, and exclude critical low-level base system packages
+        ALL_TARGETS=$(echo -e "${RAW_DEPS}\n${BUILD_DEPS}" | sort -u | grep -E -v '^(libc6|gcc|systemd|base-|dpkg|debconf|perl|python3$|bash|coreutils|sed|grep|gawk|tar|gzip|findutils|udev|init|linux-)')
+        
+        # Ensure 'nala' itself is at the very end of our explicit download queue
+        DOWNLOAD_LIST=$(echo "${ALL_TARGETS}" | grep -v '^nala$')
+        DOWNLOAD_LIST="${DOWNLOAD_LIST} nala"
+        
+        for pkg in $DOWNLOAD_LIST; do
+          if [ ! -d "$pkg" ]; then
+            echo "Downloading source for package: $pkg"
+            # Extract source recipe files into individual directories
+            apt-get source --download-only "$pkg" 2>/dev/null || true
+            
+            # Find downloaded dsc descriptor and unpack it cleanly into its own folder
+            DSC_FILE=$(ls ${pkg}_*.dsc 2>/dev/null | head -n 1)
+            if [ -n "$DSC_FILE" ]; then
+              dpkg-source -x "$DSC_FILE" "$pkg"
+              rm -f ${pkg}_*
+            fi
+          fi
+        done
+        cd ../
+
+    - name: Bulk Build Full Graph for LAOS Suites
+        # Configure dummy git identification for changelog bumps
+      run: |
+        DISTS=("sequoia" "sequoia-updates" "sequoia-security")
+        ARCHS=("amd64" "i386")
+        
+        export DEBFULLNAME="Luke Angel OS Build Bot"
+        export DEBEMAIL="buildbot@lusd1.org"
+        
+        # Auto-detect directories downloaded during step 2
+        PACKAGES=$(ls src/)
+        
+        for DIST in "${DISTS[@]}"; do
+          echo "=========================================="
+          echo "Processing Distribution Suite: $DIST"
+          echo "=========================================="
+          
+          mkdir -p "debs/$DIST"
+          
+          for pkg in $PACKAGES; do
+            if [ -d "src/$pkg/debian" ]; then
+              
+              for ARCH in "${ARCHS[@]}"; do
+                echo "Compiling component: $pkg for $DIST ($ARCH)..."
+                
+                # Clone target files to an isolated architecture compilation folder
+                cp -r "src/$pkg" "src/${pkg}_${ARCH}_tmp"
+                cd "src/${pkg}_${ARCH}_tmp"
+                
+                # Append ~LAOS1 to version and map the specific suite target
+                CURRENT_VERSION=$(dpkg-parsechangelog -S Version)
+                NEW_VERSION="${CURRENT_VERSION}~LAOS1"
+                dch --newversion "$NEW_VERSION" --distribution "$DIST" "Official bulk dependency build for Luke Angel OS ($DIST)."
+                
+                # Resolve dependency conflicts for cross architecture compiling
+                sudo mk-build-deps -i -r -a $ARCH -t "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y"
+                
+                # Build binary-only packages for target architecture
+                dpkg-buildpackage -us -uc -b -a $ARCH
+                
+                cd ../../
+                
+                # Shift generated customized binaries safely to the destination suite directory
+                mv src/*.deb "debs/$DIST/" 2>/dev/null || true
+                
+                # Wipe temporary compilation directory
+                rm -rf "src/${pkg}_${ARCH}_tmp"
+                rm -f src/*builddeps*.deb
+              done
+              
+            fi
+          done
+        done
+
+    - name: Commit Packages back to GitHub
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Track everything inside debs/
+        git add debs/
+        
+        if git diff --staged --quiet; then
+          echo "No changes found."
+        else
+          git commit -m "Automated complete dependency tree compilation for Luke Angel OS"
+          git push origin main
+        fi
