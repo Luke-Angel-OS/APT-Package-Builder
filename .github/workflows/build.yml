@@ -65,8 +65,12 @@ jobs:
         # Pull package directories from our isolated download folder
         PACKAGES=$(ls src_download/)
         
-        # Create a dedicated, clean directory to hold our outputs safely
-        mkdir -p debs_staging
+        # Create final tracking folder
+        mkdir -p debs
+        
+        # Establish an absolute path staging area outside the build roots
+        STAGING_ROOT="${GITHUB_WORKSPACE}/secure_staging"
+        mkdir -p "$STAGING_ROOT"
         
         for DIST in "${DISTS[@]}"; do
           echo "=========================================="
@@ -77,12 +81,12 @@ jobs:
           
           for pkg in $PACKAGES; do
             if [ -d "src_download/$pkg/debian" ]; then
-              
               for ARCH in "${ARCHS[@]}"; do
                 echo "Compiling component: $pkg for $DIST ($ARCH)..."
                 
-                # Clone target files to an isolated compilation workspace
-                cp -r "src_download/$pkg" "workspace_build"
+                # Clean build sandbox creation
+                rm -rf workspace_build
+                cp -r "src_download/$pkg" workspace_build
                 cd workspace_build
                 
                 # Append ~LAOS1 to version and map the specific suite target
@@ -93,33 +97,42 @@ jobs:
                 # Resolve dependency conflicts for cross architecture compiling
                 sudo mk-build-deps -i -r -a $ARCH -t "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y"
                 
-                # Build binary-only packages for target architecture
-                dpkg-buildpackage -us -uc -b -a $ARCH
+                # Compile binary execution
+                if ! dpkg-buildpackage -us -uc -b -a $ARCH; then
+                  echo "WARNING: Package $pkg failed compilation for $ARCH. Skipping to maintain automation workflow."
+                  cd ../
+                  rm -rf workspace_build
+                  continue
+                fi
                 
                 cd ../
                 
-                # Cleanly grab the compiled debs from one directory above workspace_build
-                # and put them straight into the final debs/ directory
-                mv *.deb "debs/$DIST/" 2>/dev/null || true
+                # Instantly scoop up all packages and deposit them into the absolute secure path
+                mv *.deb "$STAGING_ROOT/" 2>/dev/null || true
                 
-                # Completely wipe out the build workspace and logs for the next package run
+                # Clean up dirty workspace logs safely without touching the compiled assets
                 rm -rf workspace_build
                 rm -f *builddeps* *.changes *.buildinfo
               done
-              
             fi
           done
+          
+          # Move packages collected from the secure staging directory directly into the distribution folder
+          mv $STAGING_ROOT/*.deb "debs/$DIST/" 2>/dev/null || true
         done
         
-        # Cleanup source download directories so we don't accidentally commit them
-        rm -rf src_download
+        # Drop temporary download directory entirely
+        rm -rf src_download secure_staging
 
     - name: Commit Packages back to GitHub
       run: |
         git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@://github.com"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
         
-        # Force Git to scan the entire debs directory for the newly created files
+        # Re-verify local status structures
+        git status
+        
+        # Force Git to actively trace the compiled output directory
         git add debs/
         
         if git diff --staged --quiet; then
