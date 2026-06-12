@@ -22,13 +22,17 @@ jobs:
         sudo apt-get install -y devscripts debhelper dpkg-dev build-essential \
                                 gcc-multilib g++-multilib apt-rdepends
 
-    - name: Auto-Fetch Complete Dependency Sources
+    - name: Enable Ubuntu Source Repositories & Fetch Sources
       run: |
-        mkdir -p src_download/
-        cd src_download/
+        mkdir -p src_download
+        cd src_download
         
-        # Enable source repositories in the runner
-        sudo sed -i 's/^# deb-src/deb-src/g' /etc/apt/sources.list || true
+        # Explicitly rewrite the apt sources file to include deb-src for the current runner version
+        SUITE=$(lsb_release -cs)
+        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE} main restricted universe multiverse" | sudo tee -p /etc/apt/sources.list.d/ubuntu-sources.list
+        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE}-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ubuntu-sources.list
+        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE}-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ubuntu-sources.list
+        
         sudo apt-get update
         
         echo "=== Mapping and Fetching Package Graph ==="
@@ -43,12 +47,15 @@ jobs:
         for pkg in $DOWNLOAD_LIST; do
           if [ ! -d "$pkg" ]; then
             echo "Downloading source for package: $pkg"
-            apt-get source --download-only "$pkg" 2>/dev/null || true
+            # Extract source recipe files into individual directories natively
+            apt-get source --download-only "$pkg" || true
             
             DSC_FILE=$(ls ${pkg}_*.dsc 2>/dev/null | head -n 1)
             if [ -n "$DSC_FILE" ]; then
               dpkg-source -x "$DSC_FILE" "$pkg"
               rm -f ${pkg}_*
+            else
+              echo "Warning: Could not extract source structure for $pkg"
             fi
           fi
         done
@@ -62,8 +69,12 @@ jobs:
         export DEBFULLNAME="Luke Angel OS Build Bot"
         export DEBEMAIL="buildbot@lusd1.org"
         
-        # Pull package directories from our isolated download folder
+        # Verify if downloaded packages exist
         PACKAGES=$(ls src_download/)
+        if [ -z "$PACKAGES" ]; then
+          echo "ERROR: No package sources were downloaded! Pipeline aborted."
+          exit 1
+        fi
         
         # Create final tracking folder
         mkdir -p debs
@@ -99,7 +110,7 @@ jobs:
                 
                 # Compile binary execution
                 if ! dpkg-buildpackage -us -uc -b -a $ARCH; then
-                  echo "WARNING: Package $pkg failed compilation for $ARCH. Skipping to maintain automation workflow."
+                  echo "WARNING: Package $pkg failed compilation for $ARCH. Skipping."
                   cd ../
                   rm -rf workspace_build
                   continue
@@ -129,11 +140,9 @@ jobs:
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         
-        # Re-verify local status structures
+        # Triggers hard force add to overwrite any default .gitignore policies guarding build objects
+        git add -F debs/ || git add debs/
         git status
-        
-        # Force Git to actively trace the compiled output directory
-        git add debs/
         
         if git diff --staged --quiet; then
           echo "No new compiled packages found to commit."
