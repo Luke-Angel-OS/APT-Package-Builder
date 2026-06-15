@@ -1,4 +1,4 @@
-name: Bulk Build Luke Angel OS Core Dependency Tree
+name: Bulk Mirror LAOS Categories to Arch-Specific Folders
 
 on:
   push:
@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-packages:
-    runs-on: ubuntu-26.04
+  mirror-packages:
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout Code
@@ -15,138 +15,73 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Configure Multiarch and Install Mapping Utilities
+    - name: Configure Multiarch and Mapping Tools
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y devscripts debhelper dpkg-dev build-essential \
-                                gcc-multilib g++-multilib apt-rdepends
+        sudo apt-get install -y apt-rdepends dpkg-dev
 
-    - name: Enable Ubuntu Source Repositories & Fetch Sources
+    - name: Mirror Categories and NVIDIA Drivers
       run: |
-        mkdir -p src_download
-        cd src_download
-        
-        # Explicitly rewrite the apt sources file to include deb-src for the current runner version
-        SUITE=$(lsb_release -cs)
-        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE} main restricted universe multiverse" | sudo tee -p /etc/apt/sources.list.d/ubuntu-sources.list
-        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE}-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ubuntu-sources.list
-        echo "deb-src https://archive.ubuntu.com/ubuntu ${SUITE}-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/ubuntu-sources.list
-        
-        sudo apt-get update
-        
-        echo "=== Mapping and Fetching Package Graph ==="
-        RAW_DEPS=$(apt-rdepends --follow=Depends,Recommends nala 2>/dev/null | grep -v '^ ' | grep -v 'E:')
-        BUILD_DEPS=$(apt-cache showsrc nala | grep -E '^Build-Depends:' | sed 's/Build-Depends://g' | tr ',' '\n' | awk '{print $1}')
-        
-        ALL_TARGETS=$(echo -e "${RAW_DEPS}\n${BUILD_DEPS}" | sort -u | grep -E -v '^(libc6|gcc|systemd|base-|dpkg|debconf|perl|python3$|bash|coreutils|sed|grep|gawk|tar|gzip|findutils|udev|init|linux-)')
-        
-        DOWNLOAD_LIST=$(echo "${ALL_TARGETS}" | grep -v '^nala$')
-        DOWNLOAD_LIST="${DOWNLOAD_LIST} nala"
-        
-        for pkg in $DOWNLOAD_LIST; do
-          if [ ! -d "$pkg" ]; then
-            echo "Downloading source for package: $pkg"
-            # Extract source recipe files into individual directories natively
-            apt-get source --download-only "$pkg" || true
-            
-            DSC_FILE=$(ls ${pkg}_*.dsc 2>/dev/null | head -n 1)
-            if [ -n "$DSC_FILE" ]; then
-              dpkg-source -x "$DSC_FILE" "$pkg"
-              rm -f ${pkg}_*
-            else
-              echo "Warning: Could not extract source structure for $pkg"
-            fi
-          fi
-        done
-        cd ../
-
-    - name: Bulk Build Full Graph for LAOS Suites
-      run: |
-        DISTS=("sequoia" "sequoia-updates" "sequoia-security")
         ARCHS=("amd64" "i386")
         
-        export DEBFULLNAME="Luke Angel OS Build Bot"
-        export DEBEMAIL="buildbot@lusd1.org"
+        # Comprehensive categories based on your project requirements
+        DEVELOPMENT=("build-essential" "git" "python3" "qtbase5-dev" "nodejs" "code")
+        GAMING=("minecraft-launcher" "steam-installer" "lutris" "mangohud")
+        BROWSERS=("firefox" "chromium-browser")
+        PRODUCTIVITY=("libreoffice" "thunderbird" "evince")
+        GRAPHICS=("gimp" "inkscape" "blender")
+        DESKTOP=("ubuntu-desktop" "gnome-shell" "xfce4" "kde-plasma-desktop")
+        # NVIDIA drivers for various hardware ages
+        NVIDIA_DRIVERS=("nvidia-driver-550" "nvidia-driver-535" "nvidia-driver-470" "nvidia-driver-390")
         
-        # Verify if downloaded packages exist
-        PACKAGES=$(ls src_download/)
-        if [ -z "$PACKAGES" ]; then
-          echo "ERROR: No package sources were downloaded! Pipeline aborted."
-          exit 1
-        fi
-        
-        # Create final tracking folder
-        mkdir -p debs
-        
-        # Establish an absolute path staging area outside the build roots
-        STAGING_ROOT="${GITHUB_WORKSPACE}/secure_staging"
-        mkdir -p "$STAGING_ROOT"
-        
-        for DIST in "${DISTS[@]}"; do
-          echo "=========================================="
-          echo "Processing Distribution Suite: $DIST"
-          echo "=========================================="
+        ALL_PACKAGES=("${DEVELOPMENT[@]}" "${GAMING[@]}" "${BROWSERS[@]}" "${PRODUCTIVITY[@]}" "${GRAPHICS[@]}" "${DESKTOP[@]}" "${NVIDIA_DRIVERS[@]}" "nala")
+
+        # Create separate staging areas for each architecture
+        mkdir -p staging_amd64 staging_i386
+
+        for pkg in "${ALL_PACKAGES[@]}"; do
+          echo "Processing package: $pkg"
+          # Get recursive dependencies
+          DEPS=$(apt-rdepends --follow=Depends,PreDepends "$pkg" 2>/dev/null | grep -v '^ ' | grep -v 'E:')
           
-          mkdir -p "debs/$DIST"
-          
-          for pkg in $PACKAGES; do
-            if [ -d "src_download/$pkg/debian" ]; then
-              for ARCH in "${ARCHS[@]}"; do
-                echo "Compiling component: $pkg for $DIST ($ARCH)..."
-                
-                # Clean build sandbox creation
-                rm -rf workspace_build
-                cp -r "src_download/$pkg" workspace_build
-                cd workspace_build
-                
-                # Append ~LAOS1 to version and map the specific suite target
-                CURRENT_VERSION=$(dpkg-parsechangelog -S Version)
-                NEW_VERSION="${CURRENT_VERSION}~LAOS1"
-                dch --newversion "$NEW_VERSION" --distribution "$DIST" "Official bulk dependency build for Luke Angel OS ($DIST)."
-                
-                # Resolve dependency conflicts for cross architecture compiling
-                sudo mk-build-deps -i -r -a $ARCH -t "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y"
-                
-                # Compile binary execution
-                if ! dpkg-buildpackage -us -uc -b -a $ARCH; then
-                  echo "WARNING: Package $pkg failed compilation for $ARCH. Skipping."
-                  cd ../
-                  rm -rf workspace_build
-                  continue
-                fi
-                
-                cd ../
-                
-                # Instantly scoop up all packages and deposit them into the absolute secure path
-                mv *.deb "$STAGING_ROOT/" 2>/dev/null || true
-                
-                # Clean up dirty workspace logs safely without touching the compiled assets
-                rm -rf workspace_build
-                rm -f *builddeps* *.changes *.buildinfo
-              done
-            fi
+          for item in $DEPS; do
+            for ARCH in "${ARCHS[@]}"; do
+              # Download pre-compiled binaries into arch-specific staging folders
+              cd "staging_$ARCH"
+              apt-get download "${item}:${ARCH}" 2>/dev/null || true
+              cd ../
+            done
           done
-          
-          # Move packages collected from the secure staging directory directly into the distribution folder
-          mv $STAGING_ROOT/*.deb "debs/$DIST/" 2>/dev/null || true
         done
         
-        # Drop temporary download directory entirely
-        rm -rf src_download secure_staging
+        # Organize into final debs/amd64/packages and debs/i386/packages
+        for ARCH in "${ARCHS[@]}"; do
+          FINAL_DIR="debs/$ARCH/packages"
+          mkdir -p "$FINAL_DIR"
+          
+          # Move binaries to their specific packages folder
+          cp staging_$ARCH/*.deb "$FINAL_DIR/" 2>/dev/null || true
+          
+          # Generate the required Packages index file for each architecture
+          # This is critical for APT to recognize the folder as a repository
+          cd "$FINAL_DIR"
+          dpkg-scanpackages . /dev/null > Packages
+          gzip -9c Packages > Packages.gz
+          cd ../../../
+        done
 
-    - name: Commit Packages back to GitHub
+        rm -rf staging_amd64 staging_i386
+
+    - name: Commit Packages and Indices to Repository
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         
-        # Triggers hard force add to overwrite any default .gitignore policies guarding build objects
-        git add -F debs/ || git add debs/
-        git status
-        
+        git add debs/
         if git diff --staged --quiet; then
-          echo "No new compiled packages found to commit."
+          echo "No new packages found."
         else
-          git commit -m "Automated complete dependency tree compilation for Luke Angel OS"
+          git commit -m "Mirroring categories into architecture-specific packages folders"
           git push origin main
         fi
